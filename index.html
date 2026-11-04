@@ -411,7 +411,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/epub.js/0.3.93/epub.min.js"></script>
 <script>
 'use strict';
 /* =========================================================
@@ -861,10 +860,11 @@ async function parseBook(file) {
       } catch (e) {}
       destroyPdf(pdf);
     } else {
-      const book = ePub(buf); await book.ready;
-      try { const md = await book.loaded.metadata; if (md.title) out.title = md.title.trim(); if (md.creator) out.author = String(md.creator).trim(); } catch (e) {}
-      try { const u = await book.coverUrl(); if (u) out.coverBlob = await shrinkToJpeg(u, 420); } catch (e) {}
-      try { book.destroy(); } catch (e) {}
+      const eb = await openEpubZip(buf);
+      if (eb.title) out.title = eb.title;
+      if (eb.author) out.author = eb.author;
+      try { if (eb.coverPath) { const cb = await eb.fileBlob(eb.coverPath); if (cb) { const u = URL.createObjectURL(cb); out.coverBlob = await shrinkToJpeg(u, 420); URL.revokeObjectURL(u); } } } catch (e) {}
+      eb.free();
     }
   } catch (e) { out.error = 'No se pudo leer el archivo (¿está dañado o protegido?)'; }
   return out;
@@ -1028,9 +1028,8 @@ function closeReader(fromPop) {
   hideBar(); $('settings').hidden = true;
   try { R.io && R.io.disconnect(); } catch (e) {}
   destroyPdf(R.pdf);
-  try { if (R.rend) R.rend.destroy(); } catch (e) {}
-  try { if (R.book) R.book.destroy(); } catch (e) {}
-  R.pdf = R.rend = R.book = R.io = null; R.pgs = null;
+  epubTeardown();
+  R.pdf = R.io = null; R.pgs = null;
   $('pdfHost').innerHTML = ''; $('epubView').innerHTML = '';
   $('reader').hidden = true; document.body.classList.remove('reading');
   if (!fromPop && history.state && history.state.reader) history.back();
@@ -1039,7 +1038,7 @@ function closeReader(fromPop) {
 $('rBack').onclick = () => closeReader(false);
 window.addEventListener('popstate', () => { if (R.open) closeReader(true); });
 window.addEventListener('pagehide', () => { if (R.open) { try { saveProgNow(R.prog, currentLoc()); } catch (e) {} } });
-const currentLoc = () => R.type === 'pdf' ? pdfLoc() : (R.cur ? R.cur.start.cfi : null);
+const currentLoc = () => R.type === 'pdf' ? pdfLoc() : (R.cur || null);
 
 /* ---------- Apariencia ---------- */
 $('rSet').onclick = e => { e.stopPropagation(); $('settings').hidden = !$('settings').hidden; };
@@ -1049,18 +1048,18 @@ function updateSizeLbl() { $('sVal').textContent = R.type === 'pdf' ? Math.round
 $('settings').querySelector('.themes').onclick = e => {
   const b = e.target.closest('button'); if (!b) return;
   prefs.theme = b.dataset.t; savePrefs(); applyReaderTheme();
-  if (R.type === 'epub' && R.rend) { R.rend.themes.select(prefs.theme); repaintEpubHl(); }
+  if (R.type === 'epub' && R.doc) epubApplyStyle(true);
 };
 $('sMinus').onclick = () => stepSize(-1);
 $('sPlus').onclick = () => stepSize(1);
 function stepSize(d) {
   if (R.type === 'pdf') { prefs.zoom = Math.min(3, Math.max(0.5, Math.round((prefs.zoom + d * 0.1) * 10) / 10)); savePrefs(); updateSizeLbl(); layoutPdf(true); }
-  else { prefs.font = Math.min(220, Math.max(70, prefs.font + d * 10)); savePrefs(); updateSizeLbl(); if (R.rend) R.rend.themes.fontSize(prefs.font + '%'); }
+  else { prefs.font = Math.min(220, Math.max(70, prefs.font + d * 10)); savePrefs(); updateSizeLbl(); if (R.type === 'epub' && R.doc) epubApplyStyle(true); }
 }
 $('settings').querySelector('.twoopt').onclick = async e => {
   const b = e.target.closest('button'); if (!b || prefs.flow === b.dataset.f) return;
   prefs.flow = b.dataset.f; savePrefs(); syncSettingsUI();
-  if (R.type === 'epub' && R.book) await startRendition(R.cur && R.cur.start.cfi);
+  if (R.type === 'epub' && R.doc) await epubApplyStyle(true);
 };
 
 /* ---------- Panel lateral ---------- */
@@ -1212,9 +1211,9 @@ function addHighlight(st, note) {
     ctx.parts.forEach((pt, i) => R.hl.push({ id: uid(), kind: st.k, color: st.c, page: pt.page, rects: pt.rects, text: pt.text, note: i === 0 ? note : '', t: Date.now(), pos: (pt.page - 1 + pt.rects[0].y) / R.pdf.numPages, label: 'Pág. ' + pt.page }));
     drawAllHlPdf(); try { getSelection().removeAllRanges(); } catch (e) {}
   } else {
-    const h = { id: uid(), kind: st.k, color: st.c, cfi: ctx.cfi, text: ctx.text, note, t: Date.now(), pos: R.prog, label: chapterLabel(R.cur && R.cur.start.href) || Math.round(R.prog * 100) + '%' };
+    const h = { id: uid(), kind: st.k, color: st.c, idx: ctx.idx, start: ctx.start, end: ctx.end, text: ctx.text, note, t: Date.now(), pos: R.prog, label: chapterLabel(ctx.idx) || Math.round(R.prog * 100) + '%' };
     R.hl.push(h); paintEpub(h);
-    try { ctx.contents.window.getSelection().removeAllRanges(); } catch (e) {}
+    try { R.doc.getSelection().removeAllRanges(); } catch (e) {}
   }
   saveHl(); hideBar(); renderPanel();
 }
@@ -1368,7 +1367,7 @@ function onPdfScroll() {
 }
 function goPdfPage(p, y) { const sc = pdfSc(), el = R.pgs[p - 1]; if (!el) return; sc.scrollTop = el.offsetTop + (y || 0) * el.offsetHeight - 8; }
 async function goToc(n) {
-  if (R.type === 'epub') { try { await R.rend.display(n.href); } catch (e) { toast('No se pudo abrir esa sección'); } return; }
+  if (R.type === 'epub') { if (n.idx >= 0) epubGo(n.idx, { frag: n.frag, p: 0 }); return; }
   try {
     let dest = n.dest; if (!dest) return;
     if (typeof dest === 'string') dest = await R.pdf.getDestination(dest);
@@ -1382,8 +1381,8 @@ function pdfBookmark() {
   if (R.bm.some(b => b.loc && b.loc.page === loc.page)) { toast('Ya tienes un marcador en esta página'); return null; }
   return { id: uid(), label: 'Página ' + loc.page, loc, pos: (loc.page - 1 + loc.y) / R.pdf.numPages, t: Date.now() };
 }
-function goBm(b) { if (R.type === 'pdf') goPdfPage(b.loc.page, b.loc.y); else R.rend.display(b.cfi).catch(() => {}); }
-function goHl(h) { if (R.type === 'pdf') goPdfPage(h.page, Math.max(0, h.rects[0].y - 0.05)); else R.rend.display(h.cfi).catch(() => {}); }
+function goBm(b) { if (R.type === 'pdf') goPdfPage(b.loc.page, b.loc.y); else epubGo(b.idx, { p: b.p }); }
+function goHl(h) { if (R.type === 'pdf') goPdfPage(h.page, Math.max(0, h.rects[0].y - 0.05)); else epubGo(h.idx, { off: h.start, len: h.end - h.start, p: 0 }); }
 async function searchPdf(q, my) {
   const ql = q.toLowerCase(); R.pageText = R.pageText || {};
   for (let p = 1; p <= R.pdf.numPages && R.results.length < 100; p++) {
@@ -1467,114 +1466,518 @@ function onPdfClick(e) {
 }
 
 /* =========================================================
-   EPUB
+   EPUB (lector propio: solo usa JSZip, sin librerías extra)
    ========================================================= */
-function epubRules(name) {
-  const t = THEMES[name];
-  if (name === 'light') return { 'body': { 'background': '#ffffff !important' } };
-  return {
-    'body': { 'background': t.bg + ' !important', 'color': t.fg + ' !important' },
-    'p, div, span, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, em, strong, i, b, small, cite, dd, dt, section, article, font': { 'color': t.fg + ' !important' },
-    'a, a *': { 'color': t.link + ' !important' }
-  };
+const XHTML_NS = 'http://www.w3.org/1999/xhtml';
+const EPUB_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', svg: 'image/svg+xml', webp: 'image/webp', css: 'text/css',
+  ttf: 'font/ttf', otf: 'font/otf', woff: 'font/woff', woff2: 'font/woff2', mp3: 'audio/mpeg', mp4: 'video/mp4', xhtml: 'application/xhtml+xml', html: 'text/html' };
+const mimeOf = p => EPUB_MIME[(String(p).split('.').pop() || '').toLowerCase()] || 'application/octet-stream';
+const isExternal = u => /^(data:|blob:|https?:|mailto:|tel:|#)/i.test(String(u).trim());
+
+function normPath(base, rel) {
+  rel = String(rel || '').split('#')[0].split('?')[0];
+  try { rel = decodeURIComponent(rel); } catch (e) {}
+  if (!rel) return base;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(rel) || rel.startsWith('//')) return null;
+  const parts = rel.startsWith('/') ? [] : base.split('/').slice(0, -1);
+  rel.split('/').forEach(seg => { if (seg === '..') parts.pop(); else if (seg !== '.' && seg !== '') parts.push(seg); });
+  return parts.join('/');
 }
-async function initEpub(buf, saved, sid) {
-  if (!window.ePub) throw new Error('No se pudo cargar el visor de EPUB. Revisa tu conexión a internet.');
-  const book = ePub(buf); R.book = book;
-  await book.ready;
-  if (sid !== R.sid) return;
-  await startRendition(saved && saved.loc);
-  if (sid !== R.sid) return;
-  book.loaded.navigation.then(nav => { R.toc = nav.toc || []; renderPanel(); }).catch(() => { R.toc = []; renderPanel(); });
-  const key = 'bib-loc:' + R.item.id, cached = LS.get(key, null);
-  let ready;
-  if (cached) { try { book.locations.load(cached); ready = Promise.resolve(); } catch (e) { ready = null; } }
-  if (!ready) ready = book.locations.generate(1200).then(() => { try { const s = book.locations.save(); if (s.length < 400000) LS.set(key, s); } catch (e) {} });
-  ready.then(() => { if (sid !== R.sid) return; R.locReady = true; if (R.cur) onEpubRelocated(R.cur); }).catch(() => {});
-  $('rSlider').onchange = () => { if (R.locReady) R.rend.display(book.locations.cfiFromPercentage($('rSlider').value / 1000)).catch(() => {}); };
+const fragOf = h => { const i = String(h || '').indexOf('#'); if (i < 0) return ''; try { return decodeURIComponent(h.slice(i + 1)); } catch (e) { return h.slice(i + 1); } };
+function parseXml(text) {
+  if (text == null) return null;
+  const d = new DOMParser().parseFromString(text.replace(/^﻿/, ''), 'application/xml');
+  return d.getElementsByTagName('parsererror').length ? null : d;
 }
-async function startRendition(cfi) {
-  const view = $('epubView'); view.innerHTML = '';
-  if (R.rend) { try { R.rend.destroy(); } catch (e) {} }
-  const scroll = prefs.flow === 'scroll';
-  const rend = R.book.renderTo(view, { width: '100%', height: '100%', flow: scroll ? 'scrolled' : 'paginated', manager: scroll ? 'continuous' : 'default', spread: (!scroll && innerWidth > 1000) ? 'auto' : 'none' });
-  R.rend = rend;
-  Object.keys(THEMES).forEach(k => rend.themes.register(k, epubRules(k)));
-  rend.themes.select(prefs.theme); rend.themes.fontSize(prefs.font + '%');
-  rend.on('relocated', onEpubRelocated);
-  rend.on('selected', onEpubSelected);
-  rend.on('keyup', onReaderKey);
-  rend.on('click', () => { if (B && B.mode === 'edit') hideBar(); });
-  R.hl.forEach(paintEpub);
-  try { await rend.display(cfi || undefined); } catch (e) { await rend.display(); }
-}
-function onEpubRelocated(loc) {
-  R.cur = loc; if (!loc || !loc.start) return;
-  let p = R.locReady ? R.book.locations.percentageFromCfi(loc.start.cfi) : (loc.start.index / Math.max(1, R.book.spine.length));
-  if (loc.atEnd && R.locReady) p = 1;
-  R.prog = p || 0; saveProgSoon(R.prog, loc.start.cfi);
-  $('rSlider').value = Math.round(R.prog * 1000);
-  const ch = chapterLabel(loc.start.href);
-  $('rLbl').textContent = (R.locReady ? Math.round(R.prog * 100) + '%' : '…') + (ch ? ' · ' + ch : '');
-  $('rLbl').title = ch || '';
-}
-function chapterLabel(href) {
-  if (!href || !R.toc) return '';
-  const base = String(href).split('#')[0]; let found = '';
-  (function walk(list) { list.forEach(n => { if (n.href && n.href.split('#')[0].endsWith(base.split('/').pop()) && !found) found = (n.label || '').trim(); walk(n.subitems || []); }); })(R.toc);
-  return found;
-}
-function frameOffset(doc) { const f = doc.defaultView && doc.defaultView.frameElement; const r = f ? f.getBoundingClientRect() : { left: 0, top: 0 }; return r; }
-function onEpubSelected(cfiRange, contents) {
+const qn = (root, name) => [...root.getElementsByTagNameNS('*', name)];
+
+async function openEpubZip(buf) {
+  if (!window.JSZip) throw new Error('No se pudo cargar el lector (JSZip). Revisa tu conexión a internet.');
+  let zip;
+  try { zip = await JSZip.loadAsync(buf); } catch (e) { throw new Error('Este archivo no es un EPUB válido o está dañado.'); }
+  const lc = {}; zip.forEach(p => { lc[p.toLowerCase()] = p; });
+  const fileOf = p => zip.file(p) || (lc[String(p).toLowerCase()] ? zip.file(lc[String(p).toLowerCase()]) : null);
+  const getText = async p => { const f = fileOf(p); return f ? await f.async('string') : null; };
+  const cont = parseXml(await getText('META-INF/container.xml'));
+  const rf = cont && qn(cont, 'rootfile')[0];
+  const opfPath = rf && rf.getAttribute('full-path');
+  if (!opfPath) throw new Error('Este archivo no es un EPUB válido (falta el contenedor).');
+  const opf = parseXml(await getText(opfPath));
+  if (!opf) throw new Error('No se pudo leer la estructura del libro (OPF).');
+  const md = qn(opf, 'metadata')[0];
+  const dc = n => { const e = md && qn(md, n)[0]; return e ? e.textContent.replace(/\s+/g, ' ').trim() : ''; };
+  const man = {};
+  const manEl = qn(opf, 'manifest')[0];
+  (manEl ? qn(manEl, 'item') : []).forEach(it => {
+    const id = it.getAttribute('id'); if (!id) return;
+    man[id] = { id, path: normPath(opfPath, it.getAttribute('href')), type: it.getAttribute('media-type') || '', props: it.getAttribute('properties') || '' };
+  });
+  const spineEl = qn(opf, 'spine')[0];
+  let spine = (spineEl ? qn(spineEl, 'itemref') : []).map(r => ({ ref: r, it: man[r.getAttribute('idref')] }))
+    .filter(x => x.it && x.it.path && /html|xml/.test(x.it.type) && !/ncx/.test(x.it.type))
+    .map(x => ({ id: x.it.id, path: x.it.path, linear: x.ref.getAttribute('linear') !== 'no' }));
+  if (spine.some(s => s.linear)) spine = spine.filter(s => s.linear);
+  if (!spine.length) throw new Error('El libro no tiene capítulos legibles (¿está protegido con DRM?).');
+  const spineIdx = {}; spine.forEach((s, i) => { spineIdx[s.path] = i; spineIdx[s.path.toLowerCase()] = i; });
+  const idxOf = p => (p == null ? -1 : (spineIdx[p] !== undefined ? spineIdx[p] : (spineIdx[p.toLowerCase()] !== undefined ? spineIdx[p.toLowerCase()] : -1)));
+
+  // portada
+  let coverPath = null;
+  const ci = Object.values(man).find(m => /cover-image/.test(m.props));
+  if (ci) coverPath = ci.path;
+  if (!coverPath) { const mc = qn(opf, 'meta').find(m => m.getAttribute('name') === 'cover'); if (mc && man[mc.getAttribute('content')]) coverPath = man[mc.getAttribute('content')].path; }
+  if (!coverPath) { const g = Object.values(man).find(m => /^image\//.test(m.type) && /cover|portada/i.test(m.id + ' ' + m.path)); if (g) coverPath = g.path; }
+
+  // índice
+  let toc = [];
   try {
-    const range = R.rend.getRange(cfiRange); const text = range.toString().replace(/\s+/g, ' ').trim(); if (!text) return;
-    const fr = frameOffset(contents.document), rr = range.getBoundingClientRect();
-    showBar({ mode: 'new', ctx: { cfi: cfiRange, text, contents }, x: fr.left + rr.left + rr.width / 2, y: fr.top + rr.top });
-  } catch (e) {}
+    const nav = Object.values(man).find(m => /(^|\s)nav(\s|$)/.test(m.props));
+    if (nav) {
+      const t = await getText(nav.path);
+      let d = new DOMParser().parseFromString(t || '', 'application/xhtml+xml');
+      if (d.getElementsByTagName('parsererror').length) d = new DOMParser().parseFromString(t || '', 'text/html');
+      const navs = [...d.getElementsByTagName('nav')];
+      const tn = navs.find(n => [...n.attributes].some(a => a.localName === 'type' && /(^|\s)toc(\s|$)/.test(a.value))) || navs[0];
+      const ol = tn && [...tn.children].find(c => c.localName === 'ol');
+      const walk = o => [...o.children].filter(li => li.localName === 'li').map(li => {
+        const a = [...li.children].find(c => c.localName === 'a' || c.localName === 'span');
+        const sub = [...li.children].find(c => c.localName === 'ol');
+        const href = a && a.getAttribute && a.getAttribute('href');
+        return { label: ((a && a.textContent) || '').replace(/\s+/g, ' ').trim(), path: href ? normPath(nav.path, href) : null, frag: href ? fragOf(href) : '', subitems: sub ? walk(sub) : [] };
+      });
+      if (ol) toc = walk(ol);
+    }
+    if (!toc.length) {
+      let ncx = spineEl && man[spineEl.getAttribute('toc')];
+      if (!ncx) ncx = Object.values(man).find(m => /ncx/.test(m.type) || /\.ncx$/i.test(m.path || ''));
+      const d = ncx && parseXml(await getText(ncx.path));
+      const nm = d && qn(d, 'navMap')[0];
+      const walk = el => [...el.children].filter(c => c.localName === 'navPoint').map(pt => {
+        const lbl = qn(pt, 'text')[0]; const ct = [...pt.children].find(c => c.localName === 'content');
+        const src = ct && ct.getAttribute('src');
+        return { label: lbl ? lbl.textContent.replace(/\s+/g, ' ').trim() : '', path: src ? normPath(ncx.path, src) : null, frag: src ? fragOf(src) : '', subitems: walk(pt) };
+      });
+      if (nm) toc = walk(nm);
+    }
+  } catch (e) { toc = []; }
+  (function link(list) { list.forEach(n => { n.idx = idxOf(n.path); link(n.subitems || []); }); })(toc);
+  const flat = [];
+  (function fl(list) { list.forEach(n => { if (n.idx >= 0) flat.push(n); fl(n.subitems || []); }); })(toc);
+  flat.sort((a, b) => a.idx - b.idx);
+
+  // pesos para calcular el avance total del libro
+  const weights = spine.map(s => { const f = fileOf(s.path); const w = f && f._data && f._data.uncompressedSize; return w > 0 ? w : 1000; });
+  const total = weights.reduce((a, b) => a + b, 0);
+  const prefix = []; let acc = 0; weights.forEach(w => { prefix.push(acc); acc += w; });
+
+  const urls = new Map();
+  const eb = {
+    zip, spine, toc, flat, coverPath, weights, total, prefix, getText,
+    title: dc('title'), author: dc('creator'),
+    async fileBlob(p) { const f = fileOf(p); if (!f) return null; return new Blob([await f.async('arraybuffer')], { type: mimeOf(p) }); },
+    async blobUrl(p) {
+      if (urls.has(p)) return urls.get(p);
+      const b = await eb.fileBlob(p); const u = b ? URL.createObjectURL(b) : null; urls.set(p, u); return u;
+    },
+    free() { urls.forEach(u => u && URL.revokeObjectURL(u)); urls.clear(); }
+  };
+  return eb;
 }
-function onEpubHlClick(h, e) {
-  const fr = frameOffset(e.target.ownerDocument);
-  showBar({ mode: 'edit', id: h.id, x: fr.left + e.clientX, y: fr.top + e.clientY });
+
+/* ---------- Capítulos ---------- */
+async function chapterDom(eb, idx) {
+  const it = eb.spine[idx]; const text = await eb.getText(it.path);
+  if (text == null) throw new Error('Falta un archivo del libro (' + it.path + ')');
+  const x = new DOMParser().parseFromString(text, 'application/xhtml+xml');
+  if (!x.getElementsByTagName('parsererror').length && x.documentElement && x.documentElement.localName === 'html' && x.documentElement.namespaceURI === XHTML_NS) return { doc: x, xml: true, path: it.path };
+  return { doc: new DOMParser().parseFromString(text, 'text/html'), xml: false, path: it.path };
+}
+async function cssFix(eb, css, basePath, depth) {
+  for (const m of [...css.matchAll(/@import\s+(?:url\(\s*)?["']?([^"')\s;]+)["']?\s*\)?[^;]*;/g)]) {
+    let rep = '';
+    const p = isExternal(m[1]) ? null : normPath(basePath, m[1]);
+    if (p && depth < 3) { const t = await eb.getText(p); if (t != null) rep = await cssFix(eb, t, p, depth + 1); }
+    css = css.replace(m[0], rep);
+  }
+  for (const m of [...css.matchAll(/url\(\s*(["']?)([^"')]+)\1\s*\)/g)]) {
+    const ref = m[2].trim(); if (isExternal(ref)) continue;
+    const p = normPath(basePath, ref); if (!p) continue;
+    const u = await eb.blobUrl(p); if (u) css = css.split(m[0]).join('url("' + u + '")');
+  }
+  return css;
+}
+async function renderChapter(idx) {
+  const eb = R.eb, { doc, xml, path } = await chapterDom(eb, idx);
+  const el = (n, attrs) => { const e = doc.createElementNS(XHTML_NS, n); Object.keys(attrs || {}).forEach(k => e.setAttribute(k, attrs[k])); return e; };
+  doc.querySelectorAll('script').forEach(s => s.remove());
+  doc.querySelectorAll('*').forEach(e => { [...e.attributes].forEach(a => { if (/^on/i.test(a.name)) e.removeAttribute(a.name); }); });
+  const fix = async (node, attrs) => {
+    for (const a of attrs) {
+      const v = node.getAttribute(a); if (!v || isExternal(v)) continue;
+      const p = normPath(path, v); const u = p && await eb.blobUrl(p); if (u) node.setAttribute(a, u);
+    }
+  };
+  for (const n of doc.querySelectorAll('img, video, audio, source')) { await fix(n, ['src']); n.removeAttribute('srcset'); }
+  for (const n of doc.querySelectorAll('image')) await fix(n, ['href', 'xlink:href']);
+  for (const n of [...doc.querySelectorAll('style')]) n.textContent = await cssFix(eb, n.textContent, path, 0);
+  for (const l of [...doc.querySelectorAll('link')]) {
+    const rel = (l.getAttribute('rel') || '').toLowerCase(), href = l.getAttribute('href');
+    if (rel.includes('stylesheet') && href && !isExternal(href)) {
+      const p = normPath(path, href); const t = p && await eb.getText(p);
+      if (t != null) { const st = el('style'); st.textContent = await cssFix(eb, t, p, 0); l.replaceWith(st); continue; }
+    }
+    l.remove();
+  }
+  let head = doc.getElementsByTagName('head')[0];
+  if (!head) { head = el('head'); doc.documentElement.insertBefore(head, doc.documentElement.firstChild); }
+  const base = el('style', { id: 'bib-base' });
+  base.textContent = "body{font-family:Georgia,'Times New Roman',serif;line-height:1.6} img,svg,video{max-width:100%}";
+  head.insertBefore(base, head.firstChild);
+  head.appendChild(el('style', { id: 'bib-dyn' }));
+  const body = doc.getElementsByTagName('body')[0];
+  if (!body) throw new Error('El capítulo está vacío o dañado');
+  const end = el('div', { id: 'bib-end' });
+  const a1 = el('a', { id: 'bib-prev' }); a1.textContent = '← Capítulo anterior';
+  const a2 = el('a', { id: 'bib-next' }); a2.textContent = 'Capítulo siguiente →';
+  end.append(a1, a2); body.appendChild(end);
+  const out = xml ? new XMLSerializer().serializeToString(doc) : '<!doctype html>' + doc.documentElement.outerHTML;
+  return URL.createObjectURL(new Blob([out], { type: xml ? 'application/xhtml+xml;charset=utf-8' : 'text/html;charset=utf-8' }));
+}
+
+/* ---------- Texto y posiciones (para subrayar) ---------- */
+function textNodesOf(root) {
+  const out = [];
+  const w = root.ownerDocument.createTreeWalker(root, 4, n => {
+    for (let e = n.parentNode; e && e !== root; e = e.parentNode) {
+      const nm = (e.localName || '').toLowerCase();
+      if (nm === 'script' || nm === 'style' || nm === 'noscript' || e.id === 'bib-end') return 2;
+    }
+    return 1;
+  });
+  while (w.nextNode()) out.push(w.currentNode);
+  return out;
+}
+function offsetOf(nodes, node, off) {
+  const rg = node.ownerDocument.createRange(); rg.setStart(node, off); rg.collapse(true);
+  let total = 0;
+  for (const tn of nodes) {
+    if (tn === node) return total + off;
+    if (rg.comparePoint(tn, 0) >= 0) break;
+    total += tn.length;
+  }
+  return total;
+}
+function wrapOffsets(doc, start, end, attrs, style) {
+  const body = doc.getElementsByTagName('body')[0]; if (!body || end <= start) return 0;
+  const nodes = textNodesOf(body); let cum = 0, n = 0;
+  for (const tn of nodes) {
+    const len = tn.length, s = Math.max(0, start - cum), e = Math.min(len, end - cum); cum += len;
+    if (e > s && tn.data.slice(s, e).trim()) {
+      let t = tn; if (s > 0) t = t.splitText(s);
+      if (e - s < t.length) t.splitText(e - s);
+      const m = doc.createElementNS(XHTML_NS, 'mark');
+      Object.keys(attrs).forEach(k => m.setAttribute(k, attrs[k])); m.setAttribute('style', style);
+      t.parentNode.insertBefore(m, t); m.appendChild(t); n++;
+    }
+    if (cum >= end) break;
+  }
+  return n;
+}
+const BLOCK_TAGS = /^(p|div|li|ul|ol|h[1-6]|blockquote|pre|td|th|tr|table|section|article|aside|header|footer|figure|figcaption|dd|dt|dl|br|hr)$/i;
+function blockOf(n, root) { for (let e = n.parentNode; e && e !== root; e = e.parentNode) { if (BLOCK_TAGS.test(e.localName || '')) return e; } return root; }
+function sliceText(nodes, start, end, root) {
+  let out = '', cum = 0, last = null;
+  for (const tn of nodes) {
+    const len = tn.length, s = Math.max(0, start - cum), e = Math.min(len, end - cum); cum += len;
+    if (e > s) { const b = blockOf(tn, root); if (out && last && b !== last) out += ' '; out += tn.data.slice(s, e); last = b; }
+    if (cum >= end) break;
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+function unwrapMarks(doc, sel) {
+  doc.querySelectorAll(sel).forEach(m => { const p = m.parentNode; while (m.firstChild) p.insertBefore(m.firstChild, m); p.removeChild(m); p.normalize(); });
+}
+const hexA = (hex, a) => hex + Math.round(a * 255).toString(16).padStart(2, '0');
+
+/* ---------- Estilo y paginación ---------- */
+function epubCss(Wv, Hv) {
+  const t = THEMES[prefs.theme] || THEMES.light, line = prefs.theme === 'dark' ? '#303236' : prefs.theme === 'sepia' ? '#dccfb2' : '#e4e4e0';
+  const px = Math.round(16 * prefs.font) / 100;
+  let css = 'html{font-size:' + px + 'px !important;background:' + t.bg + ' !important;-webkit-text-size-adjust:100%}'
+    + 'body{font-size:1.12rem !important;overflow-wrap:break-word}'
+    + 'mark{padding:0;color:inherit}';
+  if (prefs.theme !== 'light') css += 'body, body *:not(mark):not(img):not(svg):not(svg *){color:' + t.fg + ' !important;background-color:transparent !important}'
+    + 'a:not(#bib-z), a:not(#bib-z) *{color:' + t.link + ' !important}';
+  css += '#bib-end a{cursor:pointer;font:600 14px -apple-system,Segoe UI,Roboto,sans-serif;text-decoration:none;color:' + t.link + ' !important}';
+  const pad = Math.max(18, Math.min(52, Math.round(Wv * 0.05))), padV = 26;
+  if (prefs.flow === 'scroll') {
+    R.e.lay = { pad };
+    css += 'html{overflow:auto !important}'
+      + 'body{margin:0 auto !important;padding:' + padV + 'px ' + pad + 'px 30px !important;max-width:46rem !important;box-sizing:border-box !important}'
+      + '#bib-end{display:flex;justify-content:space-between;gap:12px;margin:2.5em 0 1em;padding-top:1em;border-top:1px solid ' + line + '}';
+  } else {
+    const cols = Wv >= 1000 ? 2 : 1, gap = 2 * pad, Wc = Wv - 2 * pad, colW = Math.floor((Wc - gap * (cols - 1)) / cols), Hc = Math.max(120, Hv - 2 * padV);
+    R.e.lay = { pad, Wv, cols };
+    css += 'html{overflow:hidden !important;width:' + Wv + 'px !important;height:' + Hv + 'px !important}'
+      + 'body{margin:' + padV + 'px ' + pad + 'px !important;padding:0 !important;max-width:none !important;box-sizing:content-box !important;width:' + Wc + 'px !important;height:' + Hc + 'px !important;'
+      + 'column-width:' + colW + 'px !important;column-gap:' + gap + 'px !important;column-fill:auto !important;overflow:visible !important}'
+      + 'img,svg,video{max-width:100% !important;max-height:' + Hc + 'px !important;object-fit:contain}'
+      + 'h1,h2,h3,h4,h5,h6{break-after:avoid}#bib-end{display:none !important}';
+  }
+  return css;
+}
+async function epubReady(doc) {
+  const imgs = [...doc.getElementsByTagName('img')];
+  await Promise.race([Promise.all(imgs.map(i => i.complete ? 0 : new Promise(r => { i.onload = i.onerror = r; }))), sleep(3500)]);
+  try { if (doc.fonts && doc.fonts.ready) await Promise.race([doc.fonts.ready, sleep(1200)]); } catch (e) {}
+}
+function epubMeasure() {
+  const e = R.e, de = R.doc.documentElement;
+  if (prefs.flow === 'scroll') { e.pages = 1; e.page = 0; return; }
+  const Wv = e.lay.Wv;
+  e.pages = Math.max(1, Math.ceil((de.scrollWidth - e.lay.pad * 0.5) / Wv));
+  e.page = Math.max(0, Math.min(e.pages - 1, e.page || 0));
+}
+function epubP() { // posición dentro del capítulo (0..1, inicio de la página visible)
+  if (!R.doc) return 0; const e = R.e, de = R.doc.documentElement;
+  if (prefs.flow === 'scroll') { const max = de.scrollHeight - de.clientHeight; return max > 0 ? de.scrollTop / max : 0; }
+  return e.pages > 1 ? e.page / e.pages : 0;
+}
+function epubSetP(p) {
+  const e = R.e, de = R.doc.documentElement; p = Math.max(0, Math.min(1, p || 0));
+  if (prefs.flow === 'scroll') { de.scrollTop = p * Math.max(0, de.scrollHeight - de.clientHeight); }
+  else { e.page = Math.min(e.pages - 1, Math.floor(p * e.pages + 1e-6)); de.scrollLeft = e.page * e.lay.Wv; }
+}
+function epubGoPage(n) { const e = R.e; e.page = Math.max(0, Math.min(e.pages - 1, n)); R.doc.documentElement.scrollLeft = e.page * e.lay.Wv; updateEpubUI(); }
+function epubOverall() {
+  const eb = R.eb, e = R.e; if (!eb || !R.doc) return 0;
+  const de = R.doc.documentElement; let within;
+  if (prefs.flow === 'scroll') { const max = de.scrollHeight - de.clientHeight; within = max > 0 ? de.scrollTop / max : 1; }
+  else within = e.pages > 0 ? (e.page + 1) / e.pages : 1;
+  return Math.max(0, Math.min(1, (eb.prefix[e.idx] + within * eb.weights[e.idx]) / eb.total));
+}
+let epubUiRaf = 0;
+function updateEpubUI() {
+  if (epubUiRaf || !R.doc) return;
+  epubUiRaf = requestAnimationFrame(() => {
+    epubUiRaf = 0; if (!R.doc || !R.eb) return;
+    R.prog = epubOverall(); R.cur = { idx: R.e.idx, p: epubP() };
+    $('rSlider').value = Math.round(R.prog * 1000);
+    const ch = chapterLabel(R.e.idx);
+    const pg = prefs.flow === 'page' && R.e.pages > 1 ? ` · pág. ${R.e.page + 1}/${R.e.pages}` : '';
+    $('rLbl').textContent = Math.round(R.prog * 100) + '%' + pg; $('rLbl').title = ch || '';
+    $('rTitle').title = ch || '';
+    saveProgSoon(R.prog, R.cur);
+  });
+}
+function chapterLabel(idx) {
+  if (!R.eb) return '';
+  let best = null;
+  for (const n of R.eb.flat) {
+    if (n.idx > idx) break;
+    if (!best || n.idx > best.idx || (n.idx === best.idx && best.frag && !n.frag)) best = n;
+  }
+  return best ? best.label : '';
+}
+
+/* ---------- Mostrar un capítulo ---------- */
+async function epubShow(idx, target) {
+  const sid = R.sid, e = R.e, tok = ++e.tok;
+  const url = await renderChapter(idx);
+  if (sid !== R.sid || tok !== e.tok) { URL.revokeObjectURL(url); return; }
+  const f = document.createElement('iframe');
+  f.setAttribute('sandbox', 'allow-same-origin');
+  f.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;background:transparent;opacity:0';
+  // el navegador dispara un 'load' del iframe vacío: esperar a que tenga el capítulo de verdad
+  const loaded = new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error('No se pudo mostrar el capítulo (tiempo agotado)')), 15000);
+    f.onload = () => { try { if (f.contentDocument && f.contentDocument.getElementById('bib-dyn')) { clearTimeout(t); res(); } } catch (err) {} };
+  });
+  f.src = url; $('epubView').appendChild(f);
+  try { await loaded; } catch (err) { f.remove(); URL.revokeObjectURL(url); throw err; }
+  if (sid !== R.sid || tok !== e.tok) { f.remove(); URL.revokeObjectURL(url); return; }
+  const old = R.frame; if (e.url) URL.revokeObjectURL(e.url);
+  R.frame = f; R.doc = f.contentDocument; e.idx = idx; e.url = url; e.page = 0;
+  const doc = R.doc;
+  doc.getElementById('bib-prev').style.display = idx > 0 ? '' : 'none';
+  doc.getElementById('bib-next').style.display = idx < R.eb.spine.length - 1 ? '' : 'none';
+  epubWire(doc);
+  doc.getElementById('bib-dyn').textContent = epubCss(f.clientWidth, f.clientHeight);
+  await epubReady(doc);
+  if (sid !== R.sid || tok !== e.tok) return;
+  epubMeasure();
+  R.hl.filter(h => h.idx === idx).forEach(paintEpub);
+  epubApplyTarget(target || { p: 0 });
+  f.style.opacity = 1; if (old) old.remove();
+  updateEpubUI();
+}
+function epubGo(idx, target) {
+  if (!R.eb || !Number.isInteger(idx) || idx < 0 || idx >= R.eb.spine.length) return;
+  if (R.doc && idx === R.e.idx) { epubApplyTarget(target); updateEpubUI(); } else epubShow(idx, target);
+}
+function epubNavigateToRect(rect) {
+  const e = R.e, de = R.doc.documentElement;
+  if (prefs.flow === 'scroll') de.scrollTop = Math.max(0, rect.top + de.scrollTop - 90);
+  else { e.page = Math.max(0, Math.min(e.pages - 1, Math.floor((rect.left + de.scrollLeft + 2) / e.lay.Wv))); de.scrollLeft = e.page * e.lay.Wv; }
+}
+function epubApplyTarget(t) {
+  const doc = R.doc; if (!doc) return;
+  if (t.frag) {
+    const el = doc.getElementById(t.frag) || doc.getElementsByName(t.frag)[0];
+    if (el) { epubNavigateToRect(el.getBoundingClientRect()); return; }
+  }
+  if (t.off != null) {
+    const body = doc.getElementsByTagName('body')[0], nodes = textNodesOf(body);
+    let cum = 0, node = null, o = 0;
+    for (const tn of nodes) { if (t.off < cum + tn.length) { node = tn; o = t.off - cum; break; } cum += tn.length; }
+    if (node) {
+      const r = doc.createRange(); r.setStart(node, o); r.setEnd(node, Math.min(node.length, o + Math.max(1, t.len || 1)));
+      epubNavigateToRect(r.getBoundingClientRect());
+      if (t.flash) {
+        wrapOffsets(doc, t.off, t.off + (t.len || 1), { 'data-flash': '1' }, 'background:#ff9f1c;color:#000');
+        setTimeout(() => { try { unwrapMarks(doc, 'mark[data-flash]'); } catch (e) {} }, 2200);
+      }
+      return;
+    }
+  }
+  epubSetP(t.p || 0);
+}
+async function epubApplyStyle(keep) {
+  if (!R.doc || !R.frame) return;
+  const doc = R.doc, p = keep ? epubP() : null, sid = R.sid;
+  doc.getElementById('bib-dyn').textContent = epubCss(R.frame.clientWidth, R.frame.clientHeight);
+  await epubReady(doc);
+  if (sid !== R.sid || doc !== R.doc) return;
+  epubMeasure(); if (p != null) epubSetP(p); updateEpubUI();
+}
+window.addEventListener('resize', debounce(() => { if (R.open && R.type === 'epub' && R.doc) epubApplyStyle(true); }, 200));
+
+/* ---------- Navegación ---------- */
+function epubNext() {
+  if (!R.doc) return; const e = R.e, de = R.doc.documentElement;
+  if (prefs.flow === 'scroll') { if (de.scrollTop + de.clientHeight < de.scrollHeight - 4) { de.scrollTop += de.clientHeight * 0.9; return; } }
+  else if (e.page < e.pages - 1) { epubGoPage(e.page + 1); return; }
+  if (e.idx < R.eb.spine.length - 1) epubShow(e.idx + 1, { p: 0 }); else toast('Llegaste al final del libro');
+}
+function epubPrev() {
+  if (!R.doc) return; const e = R.e, de = R.doc.documentElement;
+  if (prefs.flow === 'scroll') { if (de.scrollTop > 4) { de.scrollTop -= de.clientHeight * 0.9; return; } }
+  else if (e.page > 0) { epubGoPage(e.page - 1); return; }
+  if (e.idx > 0) epubShow(e.idx - 1, { p: 1 });
+}
+$('tapL').onclick = () => epubPrev();
+$('tapR').onclick = () => epubNext();
+
+/* ---------- Eventos dentro del capítulo ---------- */
+function frameRect() { return R.frame ? R.frame.getBoundingClientRect() : { left: 0, top: 0 }; }
+function epubWire(doc) {
+  let tx = 0, ty = 0, wheelAt = 0;
+  doc.addEventListener('keyup', e => onReaderKey(e));
+  doc.addEventListener('mousedown', () => { R.e.down = true; });
+  doc.addEventListener('mouseup', () => { R.e.down = false; setTimeout(checkEpubSel, 40); });
+  doc.addEventListener('selectionchange', debounce(() => { if (!R.e.down) checkEpubSel(); }, 380));
+  doc.addEventListener('click', ev => {
+    const t = ev.target;
+    if (t.closest && t.closest('#bib-prev')) { epubShow(R.e.idx - 1, { p: 0 }); return; }
+    if (t.closest && t.closest('#bib-next')) { epubShow(R.e.idx + 1, { p: 0 }); return; }
+    const m = t.closest && t.closest('mark[data-hid]');
+    const s = doc.getSelection();
+    if (m && (!s || s.isCollapsed)) { const fr = frameRect(); showBar({ mode: 'edit', id: m.getAttribute('data-hid'), x: fr.left + ev.clientX, y: fr.top + ev.clientY }); }
+    else if (B && B.mode === 'edit') hideBar();
+  });
+  doc.addEventListener('touchstart', ev => { tx = ev.touches[0].clientX; ty = ev.touches[0].clientY; }, { passive: true });
+  doc.addEventListener('touchend', ev => {
+    if (prefs.flow !== 'page') return; const s = doc.getSelection(); if (s && !s.isCollapsed) return;
+    const dx = ev.changedTouches[0].clientX - tx, dy = ev.changedTouches[0].clientY - ty;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) { dx < 0 ? epubNext() : epubPrev(); }
+  }, { passive: true });
+  doc.addEventListener('wheel', ev => {
+    if (prefs.flow !== 'page' || Math.abs(ev.deltaY) < 20 || Date.now() - wheelAt < 350) return;
+    wheelAt = Date.now(); ev.deltaY > 0 ? epubNext() : epubPrev();
+  }, { passive: true });
+  doc.addEventListener('scroll', () => updateEpubUI(), { passive: true });
+}
+function checkEpubSel() {
+  if (!R.open || R.type !== 'epub' || !R.doc) return;
+  const doc = R.doc, sel = doc.getSelection();
+  if (!sel || !sel.rangeCount || sel.isCollapsed) { if (B && B.mode === 'new' && Date.now() - B.t > 700) hideBar(); return; }
+  const range = sel.getRangeAt(0), body = doc.getElementsByTagName('body')[0];
+  if (!body.contains(range.commonAncestorContainer)) return;
+  const nodes = textNodesOf(body);
+  const start = offsetOf(nodes, range.startContainer, range.startOffset), end = offsetOf(nodes, range.endContainer, range.endOffset);
+  if (end <= start) return;
+  const text = sliceText(nodes, start, end, body); if (!text) return;
+  const rects = [...range.getClientRects()].filter(r => r.width > 1 && r.height > 1);
+  const rr = rects[0] || range.getBoundingClientRect(), fr = frameRect();
+  showBar({ mode: 'new', ctx: { idx: R.e.idx, start, end, text }, x: fr.left + rr.left + Math.min(rr.width, 200) / 2, y: fr.top + rr.top });
 }
 function paintEpub(h) {
-  if (!R.rend) return;
-  const dark = prefs.theme === 'dark';
-  const ul = h.kind === 'ul';
-  const st = ul ? { 'stroke': h.color, 'stroke-opacity': '0.95', 'stroke-width': '2' }
-                : { 'fill': h.color, 'fill-opacity': dark ? '0.38' : '0.45', 'mix-blend-mode': dark ? 'normal' : 'multiply' };
-  try { R.rend.annotations[ul ? 'underline' : 'highlight'](h.cfi, { id: h.id }, e => onEpubHlClick(h, e), 'bib-hl', st); } catch (e) {}
+  if (!R.doc || h.idx !== R.e.idx) return;
+  const style = h.kind === 'ul'
+    ? 'background:transparent;text-decoration:underline;text-decoration-color:' + h.color + ';text-decoration-thickness:2px;text-underline-offset:3px;cursor:pointer'
+    : 'background:' + hexA(h.color, 0.5) + ';cursor:pointer';
+  try { wrapOffsets(R.doc, h.start, h.end, { 'data-hid': h.id, 'class': 'bib-hl' }, style); } catch (e) {}
 }
-function unpaintEpub(h) { try { R.rend.annotations.remove(h.cfi, h.kind === 'ul' ? 'underline' : 'highlight'); } catch (e) {} }
-function repaintEpubHl() { R.hl.forEach(h => { unpaintEpub(h); paintEpub(h); }); }
+function unpaintEpub(h) { if (R.doc && h.idx === R.e.idx) { try { unwrapMarks(R.doc, 'mark[data-hid="' + h.id + '"]'); } catch (e) {} } }
 function epubBookmark() {
-  if (!R.cur) return null;
-  const cfi = R.cur.start.cfi;
-  const label = chapterLabel(R.cur.start.href) || (R.locReady ? Math.round(R.prog * 100) + '%' : 'Marcador');
-  return { id: uid(), label, cfi, pos: R.prog, t: Date.now() };
+  if (!R.eb || !R.doc) return null;
+  const p = epubP(), label = (chapterLabel(R.e.idx) || 'Capítulo ' + (R.e.idx + 1)) + (prefs.flow === 'page' && R.e.pages > 1 ? ' · pág. ' + (R.e.page + 1) : '');
+  return { id: uid(), label, idx: R.e.idx, p, pos: R.prog, t: Date.now() };
+}
+const chapterTextCache = new Map();
+async function epubChapterText(idx) {
+  if (chapterTextCache.has(R.item.id + ':' + idx)) return chapterTextCache.get(R.item.id + ':' + idx);
+  const { doc } = await chapterDom(R.eb, idx);
+  const body = doc.getElementsByTagName('body')[0];
+  let t = '', br = [], last = null;
+  if (body) textNodesOf(body).forEach(n => { const b = blockOf(n, body); if (t && last && b !== last) br.push(t.length); t += n.data; last = b; });
+  const res = { t, br }; chapterTextCache.set(R.item.id + ':' + idx, res); return res;
 }
 async function searchEpub(q, my) {
-  const items = R.book.spine.spineItems;
-  for (let i = 0; i < items.length && R.results.length < 100; i++) {
+  const n = R.eb.spine.length, ql = q.toLowerCase();
+  for (let i = 0; i < n && R.results.length < 100; i++) {
     if (my !== searchRun) return;
-    const it = items[i];
-    try {
-      await it.load(R.book.load.bind(R.book));
-      const found = it.find(q) || [];
-      it.unload();
-      found.slice(0, 100 - R.results.length).forEach(f => R.results.push({ excerpt: f.excerpt, label: chapterLabel(it.href) || '', go: () => R.rend.display(f.cfi).catch(() => {}) }));
-    } catch (e) {}
-    if (i % 4 === 0) showResults(R.results, false, `Buscando… ${i + 1} de ${items.length}`);
+    let ct; try { ct = await epubChapterText(i); } catch (e) { continue; }
+    const t = ct.t, low = t.toLowerCase(); let from = 0, k;
+    while ((k = low.indexOf(ql, from)) !== -1 && R.results.length < 100) {
+      const s = Math.max(0, k - 40), e2 = Math.min(t.length, k + q.length + 60), at = k;
+      let piece = t.slice(s, e2);
+      for (let b = ct.br.length - 1; b >= 0; b--) if (ct.br[b] > s && ct.br[b] < e2) piece = piece.slice(0, ct.br[b] - s) + ' ' + piece.slice(ct.br[b] - s);
+      R.results.push({ excerpt: ((s ? '…' : '') + piece + (e2 < t.length ? '…' : '')).replace(/\s+/g, ' '), label: chapterLabel(i) || 'Capítulo ' + (i + 1), go: () => epubGo(i, { off: at, len: q.length, flash: true }) });
+      from = k + q.length;
+    }
+    if (i % 3 === 0) showResults(R.results, false, `Buscando… capítulo ${i + 1} de ${n}`);
   }
 }
-$('tapL').onclick = () => R.rend && R.rend.prev();
-$('tapR').onclick = () => R.rend && R.rend.next();
+async function initEpub(buf, saved, sid) {
+  const eb = await openEpubZip(buf);
+  if (sid !== R.sid) { eb.free(); return; }
+  R.eb = eb; R.e = { idx: 0, page: 0, pages: 1, tok: 0, lay: { pad: 24, Wv: 600 }, down: false };
+  R.toc = eb.toc; renderPanel();
+  const loc = saved && saved.loc && typeof saved.loc === 'object' ? saved.loc : null;
+  const startIdx = loc && loc.idx >= 0 && loc.idx < eb.spine.length ? loc.idx : 0;
+  await epubShow(startIdx, { p: loc ? loc.p : 0 });
+  $('rSlider').onchange = () => {
+    const f = $('rSlider').value / 1000 * eb.total; let i = 0;
+    while (i < eb.spine.length - 1 && eb.prefix[i] + eb.weights[i] < f) i++;
+    epubGo(i, { p: Math.max(0, Math.min(1, (f - eb.prefix[i]) / eb.weights[i])) });
+  };
+}
+function epubTeardown() {
+  try { if (R.frame) R.frame.remove(); } catch (e) {}
+  try { if (R.e && R.e.url) URL.revokeObjectURL(R.e.url); } catch (e) {}
+  try { if (R.eb) R.eb.free(); } catch (e) {}
+  R.eb = null; R.doc = null; R.frame = null; R.e = { idx: 0, page: 0, pages: 1, tok: 0, lay: { pad: 24, Wv: 600 }, down: false };
+}
+R.e = { idx: 0, page: 0, pages: 1, tok: 0, lay: { pad: 24, Wv: 600 }, down: false };
 
 /* ---------- Teclado ---------- */
 function onReaderKey(e) {
-  if (!R.open || R.type !== 'epub' || !R.rend) return;
-  if (e.key === 'ArrowRight' || e.key === 'PageDown') R.rend.next();
-  else if (e.key === 'ArrowLeft' || e.key === 'PageUp') R.rend.prev();
+  if (!R.open || R.type !== 'epub' || !R.doc) return;
+  if (e.key === 'ArrowRight' || (prefs.flow === 'page' && e.key === 'PageDown')) epubNext();
+  else if (e.key === 'ArrowLeft' || (prefs.flow === 'page' && e.key === 'PageUp')) epubPrev();
 }
+
 document.addEventListener('keyup', e => { if (R.open && !/INPUT|TEXTAREA|SELECT/.test((e.target || {}).tagName || '')) onReaderKey(e); });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape' || !R.open) return;
