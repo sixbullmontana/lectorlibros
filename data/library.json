@@ -1,4 +1,60 @@
 {
   "version": 1,
-  "items": []
+  "items": [
+    {
+      "id": "mw2q5ocm2vqh3b",
+      "title": "Tontocracia",
+      "author": "Santiago Ávila",
+      "collection": "",
+      "format": "epub",
+      "file": "data/books/mw2q5ocm2vqh3b.epub",
+      "cover": "data/covers/mw2q5ocm2vqh3b.jpg",
+      "size": 839380,
+      "added": 1793833517465
+    },
+    {
+      "id": "mw2q5ocm8qb1mr",
+      "title": "Todo está j*dido (No Ficción) (Spanish Edition)",
+      "author": "Mark Manson",
+      "collection": "",
+      "format": "epub",
+      "file": "data/books/mw2q5ocm8qb1mr.epub",
+      "cover": "data/covers/mw2q5ocm8qb1mr.jpg",
+      "size": 429390,
+      "added": 1793833519348
+    },
+    {
+      "id": "mw2q5ocmd7tqkh",
+      "title": "Sobrenatural (Crecimiento personal) (Spanish Edition)",
+      "author": "Joe Dispenza",
+      "collection": "",
+      "format": "epub",
+      "file": "data/books/mw2q5ocmd7tqkh.epub",
+      "cover": "data/covers/mw2q5ocmd7tqkh.jpg",
+      "size": 7420393,
+      "added": 1793833524270
+    },
+    {
+      "id": "mw2q5ocm3qi550",
+      "title": "Tú puedes dejar tu móvil si sabes cómo",
+      "author": "María Gijón",
+      "collection": "",
+      "format": "epub",
+      "file": "data/books/mw2q5ocm3qi550.epub",
+      "cover": "data/covers/mw2q5ocm3qi550.jpg",
+      "size": 1980548,
+      "added": 1793833526794
+    },
+    {
+      "id": "mw2q5ocn24ro8w",
+      "title": "Traguese Ese Sapo",
+      "author": "Brian Tracy",
+      "collection": "",
+      "format": "epub",
+      "file": "data/books/mw2q5ocn24ro8w.epub",
+      "cover": "data/covers/mw2q5ocn24ro8w.jpg",
+      "size": 262611,
+      "added": 1793833528152
+    }
+  ]
 }
